@@ -1,0 +1,11 @@
+name: sol-wallet-tracker
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - build
+      - twine
+      - websocket-client~=1.8
+      - python-dotenv
