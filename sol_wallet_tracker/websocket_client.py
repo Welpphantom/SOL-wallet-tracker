@@ -1,6 +1,9 @@
-import websocket
+import websockets
 import json
+import asyncio
+import aiohttp
 from sol_wallet_tracker.config import HELIUS_API_KEY
+from .utils import handle_swap
 
 class WebSocketClient:
     def __init__(self, account):
@@ -15,19 +18,75 @@ class WebSocketClient:
         self.api_url = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
         self.account = account
 
-    def on_message(self, ws, message):
+    async def on_message(self, message):
         """
         Callback for handling incoming WebSocket messages.
 
-        :param ws: WebSocket connection object
         :param message: The received message in JSON format
         """
         try:
             data = json.loads(message)
-            print("Received message:", json.dumps(data, indent=4))
-            # Add custom logic to parse and process token swap data here
+            # Handle initial response that does not contain the params key
+            if "params" not in data:
+                print("Connection established:", data)
+            elif "params" in data:
+                signature = data['params']['result']['value']['signature']
+                await self.process_signature(signature)
+            else:
+                print("Unexpected message structure:", data)
+
         except json.JSONDecodeError as e:
             print("Failed to decode JSON:", e)
+        except KeyError as e:
+            print(f"KeyError: Missing expected key in message - {e}")
+
+    @staticmethod
+    async def process_signature(swap_signature):
+        """
+        Asynchronously fetches swap transaction details.
+
+        :param swap_signature: The transaction signature to fetch details for
+        :return: Swap metadata (raw JSON) or None if an error occurs
+        """
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [swap_signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            }
+            try:
+                async with session.post(
+                    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                    headers={"Content-Type": "application/json"},
+                    json=payload
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        swap_meta = data['result']['meta']
+                        if len(swap_meta['innerInstructions']) == 0:
+                            return None
+                        return swap_meta  # Return raw metadata
+                    else:
+                        print(f"Error fetching swap metadata: {response.status}")
+                        return None
+            except Exception as e:
+                print(f"Error in process_signature: {e}")
+                return None
+
+    async def process_swap(self, signature):
+        """
+        Asynchronously processes a swap transaction.
+
+        :param signature: The transaction signature to process
+        """
+        swap_meta = await self.process_signature(signature)
+        if swap_meta:
+            # Call handle_swap to process the metadata
+            action, token_ca, token_amount, sol_amount = handle_swap(swap_meta)
+            print(f"Swap Details - Action: {action}, Token: {token_ca}, Token Amount: {token_amount}, SOL Amount: {sol_amount}")
+        else:
+            print("No swap details found or error occurred.")
 
     def on_error(self, ws, error):
         """
@@ -37,6 +96,8 @@ class WebSocketClient:
         :param error: The error encountered
         """
         print("WebSocket error:", error)
+        if hasattr(error, 'args'):
+            print("Error details:", error.args)
 
     def on_close(self, ws, close_status_code, close_msg):
         """
@@ -69,15 +130,26 @@ class WebSocketClient:
         ws.send(json.dumps(subscription_message))
         print("Subscription request sent for account:", self.account)
 
-    def run(self):
+    async def run(self):
         """
         Starts the WebSocket client and listens for messages.
         """
-        ws = websocket.WebSocketApp(
-            self.api_url,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        ws.on_open = self.on_open
-        ws.run_forever(ping_interval=30, ping_timeout=10)
+        async with websockets.connect(self.api_url) as websocket:
+            print("WebSocket connected!")
+            subscription_message = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "logsSubscribe",
+                "params": [
+                    {
+                        "mentions": [self.account],
+                    },
+                    {"commitment": "confirmed"}
+                ]
+            }
+            await websocket.send(json.dumps(subscription_message))
+            print("Subscription request sent for account:", self.account)
+
+            while True:
+                message = await websocket.recv()
+                await self.on_message(message)
